@@ -8,14 +8,36 @@
         return originalAttachShadow.call(this, init);
     };
 })();
+
 // ==========================================
+// 🚀 內建極速攔截器 (阻擋不必要的追蹤腳本，提升渲染速度)
+// ==========================================
+const BLOCK_DOMAINS = [
+    'clarity.ms', 'doubleclick.net', 'google-analytics.com', 'googletagmanager.com',
+    'googlesyndication.com', 'facebook.com', 'fbcdn.net', 'popin.cc', 'tagtoo.co',
+    'lndata.com', 'rollbar.com', 'anymind360.com', 'sentry.io'
+];
+
+const observer = new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+            if (node.tagName === 'SCRIPT' || node.tagName === 'IFRAME') {
+                if (node.src && BLOCK_DOMAINS.some(domain => node.src.includes(domain))) {
+                    node.remove();
+                }
+            }
+        }
+    }
+});
+observer.observe(document.documentElement, { childList: true, subtree: true });
 
 (function () {
     'use strict';
 
     let isWaitingForResponse = false;
-    const STORAGE_KEY = 'ibon_autostart_state_v2';
-    const SETTINGS_KEY = 'ibon_user_pref_settings_v2';
+    let waitingTimeout = null;
+    const STORAGE_KEY = 'ibon_autostart_state_v3';
+    const SETTINGS_KEY = 'ibon_user_pref_settings_v3';
     const SCHEDULE_KEY = 'ibon_scheduled_time';
 
     let running = false;
@@ -26,24 +48,20 @@
     let lastReload = 0;
 
     const pageLoadTime = Date.now();
-
     const EXCLUDE_KEYWORDS = ['愛心', '身障', '輪椅', '優待'];
     const alarm = new Audio("https://actions.google.com/sounds/v1/alarms/beep_short.ogg");
     const $ = id => document.getElementById(id);
 
-    // ======== 渲染優化 ========
     function optimizeRendering() {
         const style = document.createElement('style');
         style.innerHTML = `
-            .single-header img, .event-description img, picture {
-                display: none !important;
-            }
+            .single-header img, .event-description img, picture { display: none !important; }
         `;
-        document.head.appendChild(style);
+        if(document.head) document.head.appendChild(style);
+        else document.addEventListener("DOMContentLoaded", () => document.head.appendChild(style));
     }
     optimizeRendering();
 
-    // ======== 強制深層元素挖掘器 ========
     function queryAllDeep(selector, root = document) {
         let results = Array.from(root.querySelectorAll(selector));
         const allElements = root.querySelectorAll('*');
@@ -55,16 +73,33 @@
         return results;
     }
 
+    // ======== GUI 與設定機制 ========
+    function updateUIState() {
+        const startBtn = $("start");
+        const pauseBtn = $("pause");
+        if (!startBtn || !pauseBtn) return;
+        if (running) {
+            startBtn.style.background = "#28a745";
+            startBtn.innerText = "▶ 執行中 (監控中)";
+            pauseBtn.style.opacity = "1";
+        } else {
+            startBtn.style.background = "#0066ff";
+            startBtn.innerText = "▶ 啟動";
+            pauseBtn.style.opacity = "0.5";
+        }
+    }
+
     function saveSettings() {
         if(!$("targetDate")) return;
         const config = {
             targetDate: $("targetDate").value || "",
+            areaKw: $("areaKw").value || "",
             p1: $("p1").value || "",
-            p2: $("p2").value || "",
             num: $("num").value || "2",
             mode: $("mode").value || "random",
-            ticketPref: $("ticketPref").value || "any",
-            startTime: $("startTime").value || ""
+            answer: $("answer").value || "",
+            startTime: $("startTime").value || "",
+            ticketPref: $("ticketPref") ? $("ticketPref").value : "any"
         };
         GM_setValue(SETTINGS_KEY, JSON.stringify(config));
     }
@@ -72,14 +107,17 @@
     function loadSettings() {
         const saved = GM_getValue(SETTINGS_KEY);
         if (saved) {
-            const config = JSON.parse(saved);
-            if (config.targetDate && $("targetDate")) $("targetDate").value = config.targetDate;
-            if (config.p1 && $("p1")) $("p1").value = config.p1;
-            if (config.p2 && $("p2")) $("p2").value = config.p2;
-            if (config.num && $("num")) $("num").value = config.num;
-            if (config.mode && $("mode")) $("mode").value = config.mode;
-            if (config.ticketPref && $("ticketPref")) $("ticketPref").value = config.ticketPref;
-            if (config.startTime && $("startTime")) $("startTime").value = config.startTime;
+            try {
+                const config = JSON.parse(saved);
+                if (config.targetDate && $("targetDate")) $("targetDate").value = config.targetDate;
+                if (config.areaKw && $("areaKw")) $("areaKw").value = config.areaKw;
+                if (config.p1 && $("p1")) $("p1").value = config.p1;
+                if (config.num && $("num")) $("num").value = config.num;
+                if (config.mode && $("mode")) $("mode").value = config.mode;
+                if (config.answer && $("answer")) $("answer").value = config.answer;
+                if (config.startTime && $("startTime")) $("startTime").value = config.startTime;
+                if (config.ticketPref && $("ticketPref")) $("ticketPref").value = config.ticketPref;
+            } catch(e) {}
         }
     }
 
@@ -101,59 +139,56 @@
     }
 
     function initGUI() {
-        if (document.getElementById("kenny-panel")) return;
-        if (!document.body) { setTimeout(initGUI, 300); return; }
+        if (document.getElementById("kenny-panel")) {
+            updateUIState();
+            return;
+        }
+        if (!document.body) { setTimeout(initGUI, 200); return; }
 
         const container = document.createElement("div");
         container.id = "kenny-panel";
         container.style.cssText = `
-            background:#111; color:#eee; padding:12px; position:fixed;
-            top:8%; right:20px; z-index:999999; width:280px; font-size:16px;
-            border-radius:12px; border:1px solid #666; text-align:left;
-            box-shadow: 0 0 15px rgba(0,0,0,0.5); cursor: default; max-height: 90vh; overflow-y: auto;
+            background: #111111; color: #eeeeee; padding: 12px; position: fixed; top: 15%; right: 20px;
+            z-index: 999999; width: 280px; font-size: 14px; font-family: sans-serif;
+            border-radius: 8px; border: 1px solid #333; text-align: left; box-shadow: 0 0 15px rgba(0,0,0,0.8);
+            cursor: default; box-sizing: border-box;
         `;
 
         container.innerHTML = `
-            <h3 id="kenny-header" style="margin:0 0 8px 0; text-align:center; font-size:20px; cursor:move; user-select:none; background:#222; border-radius:6px; padding:4px;"> Kenny ibon v3.0 </h3>
+            <h3 id="kenny-header" style="margin:0 0 10px 0; text-align:center; font-size:18px; font-weight:normal; cursor:move; user-select:none; background:#222; border-radius:4px; padding:6px; color:#ddd; border:1px solid #333;"> Kenny ibon v3.9 </h3>
 
-            <label style="display:block;margin:0;color:#facc15;font-weight:bold;">定時啟動 (空=立刻每秒重整)</label>
-            <input id="startTime" class="pref-input" type="text" placeholder="例：11:59:59 (留空直接重整)" style="width:100%;margin:0;font-size:16px;padding:6px;box-sizing:border-box;">
+            <label style="display:block; margin:0 0 2px 0;">場次日期 (空=不指定)</label>
+            <input id="targetDate" class="pref-input" type="text" placeholder="例：08-30 或 日" style="width:100%; margin:0 0 8px 0; font-size:15px; padding:6px; box-sizing:border-box; background:#fff; color:#000; border:none; border-radius:2px;">
 
-            <label style="display:block;margin:0;padding-top:6px;color:#ff9800;font-weight:bold;">場次日期（空=選第一場）</label>
-            <input id="targetDate" class="pref-input" type="text" placeholder="例：09/25" style="width:100%;margin:0;font-size:16px;padding:6px;box-sizing:border-box;">
+            <label style="display:block; margin:0 0 2px 0;">指定區域 (多詞可用空格隔開)</label>
+            <input id="areaKw" class="pref-input" type="text" placeholder="例：黃1B 特區" style="width:100%; margin:0 0 8px 0; font-size:15px; padding:6px; box-sizing:border-box; background:#fff; color:#000; border:none; border-radius:2px;">
 
-            <label style="display:block;margin:0;padding-top:6px;color:#4ade80;font-weight:bold;">主區/票價/票種 關鍵字</label>
-            <input id="p1" class="pref-input" type="text" placeholder="例：6400 或 單人套票" style="width:100%;margin:0;font-size:16px;padding:6px;box-sizing:border-box;">
+            <label style="display:block; margin:0 0 2px 0;">票價優先順序 (多個用逗號 , 隔開)</label>
+            <input id="p1" class="pref-input" type="text" placeholder="例：3980, 2680 (空=熱賣優先)" style="width:100%; margin:0 0 8px 0; font-size:15px; padding:6px; box-sizing:border-box; background:#fff; color:#000; border:none; border-radius:2px;">
 
-            <label style="display:block;margin:0;padding-top:6px;">備援關鍵字（空=任意）</label>
-            <input id="p2" class="pref-input" type="text" placeholder="例：7200 或 雙人票" style="width:100%;margin:0;font-size:16px;padding:6px;box-sizing:border-box;">
-
-            <div style="display:flex; gap: 8px; padding-top:6px;">
-                <div style="flex:1;">
-                    <label style="display:block;margin:0;">張數</label>
-                    <select id="num" class="pref-input" style="width:100%;margin:0;font-size:16px;padding:6px;box-sizing:border-box;">
-                        <option value="1">1</option><option value="2" selected>2</option><option value="3">3</option><option value="4">4</option>
-                    </select>
-                </div>
-                <div style="flex:1;">
-                    <label style="display:block;margin:0;">無匹配時</label>
-                    <select id="mode" class="pref-input" style="width:100%;margin:0;font-size:16px;padding:6px;box-sizing:border-box;">
-                        <option value="top">選第一個</option><option value="bottom">選最後</option><option value="random" selected>隨機</option>
-                    </select>
-                </div>
-            </div>
-
-            <label style="display:block;margin:0;padding-top:6px;color:#60a5fa;font-weight:bold;">同區票種偏好</label>
-            <select id="ticketPref" class="pref-input" style="width:100%;margin:0;font-size:16px;padding:6px;box-sizing:border-box;">
-                <option value="any">預設 (皆可)</option>
-                <option value="bonus">🎁 優先含【福利券】</option>
-                <option value="normal">🎟️ 僅限純【全票】</option>
+            <label style="display:block; margin:0 0 2px 0;">張數</label>
+            <select id="num" class="pref-input" style="width:100%; margin:0 0 8px 0; font-size:15px; padding:6px; box-sizing:border-box; background:#fff; color:#000; border:none; border-radius:2px;">
+                <option value="1">1</option><option value="2" selected>2</option><option value="3">3</option><option value="4">4</option>
             </select>
 
-            <div style="margin-top:12px;">
-                <button id="start" style="width:100%;padding:8px;margin-bottom:6px;background:#06f;color:white;font-size:18px;border-radius:6px;border:none;cursor:pointer; transition: 0.3s;"> ▶ 啟動 / 排程 </button>
-                <button id="pause" style="width:100%;padding:8px;background:#c00;color:white;font-size:18px;border-radius:6px;border:none;cursor:pointer;"> ⏸ 暫停 </button>
-            </div>
+            <label style="display:block; margin:0 0 2px 0;">模式</label>
+            <select id="mode" class="pref-input" style="width:100%; margin:0 0 8px 0; font-size:15px; padding:6px; box-sizing:border-box; background:#fff; color:#000; border:none; border-radius:2px;">
+                <option value="top">由上而下</option><option value="bottom">由下而上</option><option value="random" selected>隨機</option>
+            </select>
+
+            <label style="display:block; margin:0 0 2px 0;">同區票種偏好 (ibon 專用)</label>
+            <select id="ticketPref" class="pref-input" style="width:100%; margin:0 0 8px 0; font-size:15px; padding:6px; box-sizing:border-box; background:#fff; color:#000; border:none; border-radius:2px;">
+                <option value="any">預設 (皆可)</option><option value="bonus">🎁 優先含【福利券】</option><option value="normal">🎟️ 僅限純【全票】</option>
+            </select>
+
+            <label style="display:block; margin:0 0 2px 0;">一般驗證碼 / 問答答案 (若無則空)</label>
+            <input id="answer" class="pref-input" type="text" placeholder="例：DREAMING" style="width:100%; margin:0 0 8px 0; font-size:15px; padding:6px; box-sizing:border-box; background:#fff; color:#000; border:none; border-radius:2px;">
+
+            <label style="display:block; margin:0 0 2px 0;">啟動時間 (空=立即)</label>
+            <input id="startTime" class="pref-input" type="text" placeholder="HH:MM:SS" style="width:100%; margin:0 0 12px 0; font-size:15px; padding:6px; box-sizing:border-box; background:#fff; color:#000; border:none; border-radius:2px;">
+
+            <button id="start" style="width:100%; padding:8px; margin-bottom:6px; background:#0066ff; color:white; font-size:16px; border-radius:4px; border:none; cursor:pointer; transition:0.2s;"> ▶ 啟動 </button>
+            <button id="pause" style="width:100%; padding:8px; background:#8b0000; color:white; font-size:16px; border-radius:4px; border:none; cursor:pointer; opacity:0.5; transition:0.2s;"> ⏸ 暫停 </button>
         `;
         document.body.appendChild(container);
 
@@ -165,14 +200,12 @@
             if (!T) {
                 running = true;
                 GM_setValue(STORAGE_KEY, 'true');
-                $("start").innerText = "🔄 監控中 (每秒重整)";
-                $("start").style.background = "#10b981";
+                updateUIState();
                 toast("🚀 立即啟動！開始每秒重整。");
                 startLoop();
             } else {
                 GM_setValue(SCHEDULE_KEY, T);
-                $("start").innerText = `⏳ 等待 ${T} 開搶...`;
-                $("start").style.background = "#f59e0b";
+                updateUIState();
                 toast(`⏳ 已鎖定！系統將於 ${T} 準時開搶...`);
                 startScheduleLoop(T);
             }
@@ -184,12 +217,13 @@
             if (scheduleTimer) clearInterval(scheduleTimer);
             GM_deleteValue(STORAGE_KEY);
             GM_deleteValue(SCHEDULE_KEY);
-            $("start").innerText = "▶ 啟動 / 排程";
-            $("start").style.background = "#06f";
+            updateUIState();
             toast("⏸ 暫停中 (已取消所有任務)", "error");
             stopLoop();
         };
+
         loadSettings();
+        updateUIState();
     }
 
     function startScheduleLoop(targetTime) {
@@ -199,7 +233,6 @@
             if (now >= targetTime) {
                 clearInterval(scheduleTimer);
                 GM_deleteValue(SCHEDULE_KEY);
-
                 running = true;
                 GM_setValue(STORAGE_KEY, 'true');
                 toast("🔥 時間到，自動重整並光速啟動！");
@@ -211,45 +244,48 @@
     function toast(msg, type = "info") {
         if (!document.body) return;
         const div = document.createElement("div"); div.innerText = msg;
-        let bgColor = "rgba(0,0,0,0.9)";
-        if (type === "error") bgColor = "rgba(220, 38, 38, 0.95)";
-        if (type === "warning") bgColor = "rgba(245, 158, 11, 0.95)"; // 橘色警告
-
-        div.style.cssText = `position: fixed; top: 15%; right: 20px; z-index: 9999999; background: ${bgColor}; color: #fff; padding: 12px 20px; border-radius: 8px; font-size: 16px; font-weight: bold; box-shadow: 0 4px 12px rgba(0,0,0,0.5); pointer-events: none;`;
+        let bgColor = "rgba(0,0,0,0.85)";
+        if (type === "error") bgColor = "rgba(204, 0, 0, 0.9)";
+        if (type === "warning") bgColor = "rgba(245, 158, 11, 0.95)";
+        div.style.cssText = `position: fixed; top: 15%; right: 20px; z-index: 9999999; background: ${bgColor}; color: #fff; padding: 10px 16px; border-radius: 8px; font-size: 16px; box-shadow: 0 0 8px #000; pointer-events: none; transition: opacity 0.3s;`;
         document.body.appendChild(div);
-        setTimeout(() => { div.style.opacity = "0"; div.style.transition = "opacity 0.4s"; setTimeout(() => div.remove(), 400); }, type === "info" ? 1500 : 3500);
+        setTimeout(() => { div.style.opacity = "0"; setTimeout(() => div.remove(), 400); }, type === "info" ? 1500 : 3500);
     }
 
-    // ====================================================
-    // 🛡️ 核心新增：排隊與 Cloudflare 防護偵測引擎
-    // ====================================================
+    function setWaitingState() {
+        isWaitingForResponse = true;
+        if (waitingTimeout) clearTimeout(waitingTimeout);
+        waitingTimeout = setTimeout(() => {
+            isWaitingForResponse = false;
+        }, 5000);
+    }
+
     function isQueuingOrAntiBot() {
         const url = window.location.href;
         const html = document.body ? document.body.innerHTML : '';
         const text = document.body ? document.body.innerText : '';
         const title = document.title;
-
-        // 1. Cloudflare Turnstile 驗證特徵
-        if (html.includes('cf-turnstile') || html.includes('cf-browser-verification') || title.includes('Just a moment') || title.includes('請稍候')) {
-            return true;
-        }
-        // 2. Queue-it 虛擬排隊室特徵
-        if (url.includes('queue-it') || html.includes('queue-it') || document.getElementById('queue-it_log')) {
-            return true;
-        }
-        // 3. 網頁文字狀態特徵
-        if (text.includes('排隊中') || text.includes('正在排隊') || text.includes('驗證您是真人') || text.includes('Checking your browser')) {
-            return true;
-        }
+        if (html.includes('cf-turnstile') || html.includes('cf-browser-verification') || title.includes('Just a moment') || title.includes('請稍候')) return true;
+        if (url.includes('queue-it') || html.includes('queue-it') || document.getElementById('queue-it_log')) return true;
+        if (text.includes('排隊中') || text.includes('正在排隊') || text.includes('驗證您是真人') || text.includes('Checking your browser')) return true;
         return false;
     }
 
     function executeIbonFlow() {
         const url = window.location.href;
 
+        // 🛡️ 結帳頁面待命防護
+        if (url.includes("UTK0206_") || url.includes("Cart") || document.querySelector('input[name*="Contact"]')) {
+            if (!window.standbyNotified) {
+                toast("✅ 已進入結帳頁面！腳本轉入待命狀態，請手手動填寫資料。");
+                window.standbyNotified = true;
+            }
+            return;
+        }
+
+        // 階段一：活動主頁
         if (url.includes("ticket.ibon.com.tw/ActivityInfo/Details")) {
             const targetDate = ($("targetDate")?.value || "").trim();
-
             const bigBuyBtn = queryAllDeep('button, a, div').find(el =>
                 ((el.id && el.id.includes('BuyTicketsNow')) || (el.innerText && el.innerText.trim() === '立即購票')) &&
                 el.offsetParent !== null && !el.classList.contains('btn-buy')
@@ -286,7 +322,7 @@
                 } else { targetButton = activeBottomBtns[0]; }
 
                 if (targetButton) {
-                    isWaitingForResponse = true;
+                    setWaitingState();
                     toast("👉 按鈕已解鎖！雙重點擊突破中...");
                     if (bigBuyBtn) bigBuyBtn.click();
                     targetButton.click();
@@ -295,74 +331,119 @@
             }
 
             const now = Date.now();
-            if (now - pageLoadTime > 800) {
-                if (now - lastReload > RELOAD_COOLDOWN) {
-                    lastReload = now;
-                    toast("🔄 等待解鎖，每秒自動重整...");
-                    setTimeout(() => { if (running) window.location.reload(); }, 200);
-                }
+            if (now - pageLoadTime > 800 && now - lastReload > RELOAD_COOLDOWN) {
+                lastReload = now;
+                toast("🔄 等待解鎖，每秒自動重整...");
+                setTimeout(() => { if (running) window.location.reload(); }, 200);
             }
             return false;
         }
 
+        // 階段二：選擇票區 / 張數頁面 (UTK02 流程)
         else if (url.includes("orders.ibon.com.tw") || url.includes("UTK02")) {
             if (isWaitingForResponse) return;
 
-            const p1Clean = ($("p1").value || "").replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '');
-            const p2Clean = ($("p2").value || "").replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '');
-            const ticketPref = $("ticketPref").value;
-            const desiredNum = parseInt($("num").value) || 2;
-            const mode = $("mode").value;
+            const areaKw = $("areaKw")?.value || "";
+            const rawPriceKw = $("p1")?.value || "";
+            const ticketPref = $("ticketPref")?.value || "any";
+            const desiredNum = parseInt($("num")?.value) || 2;
+            const mode = $("mode")?.value || "random";
 
-            const hasSelects = queryAllDeep('select').some(s => s.id.includes('AMOUNT') || s.name.includes('AMOUNT'));
+            const hasSelects = Array.from(document.querySelectorAll('table select, .ticket-wrap select, select[id*="AMOUNT"], select[name*="AMOUNT"]')).length > 0;
+
             let rows = queryAllDeep("tr").filter(row => row.offsetParent !== null && row.innerText.trim().length > 2);
+            let validCandidates = [];
 
-            let scoredRows = rows.map(row => {
+            // 🌟 1. 初步篩選與 TicketPlus 權重評分系統
+            rows.forEach(row => {
                 const text = row.innerText || '';
-                if (EXCLUDE_KEYWORDS.some(k => text.includes(k))) return { row, score: -1, text };
+
+                if (text.includes('7-ELEVEN') || text.includes('注意事項') || text.includes('聯華食品') || text.includes('退票')) return;
+                if (EXCLUDE_KEYWORDS.some(k => text.includes(k))) return;
 
                 let statusText = text;
                 const statusCell = row.querySelector('td.action, td[data-title="空位"], select');
                 if (statusCell) statusText = statusCell.innerText || (statusCell.tagName==='SELECT' ? '可選' : statusText);
 
+                if (text.includes('已售完') || text.includes('缺票') || statusText.includes('完')) return;
+
                 let score = 0;
-                if (text.includes('已售完') || text.includes('缺票') || statusText.includes('完')) {
-                    score = -1;
-                } else {
-                    score = 1;
-                    const cleanText = text.replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '');
-                    if (p1Clean && cleanText.includes(p1Clean)) score += 1000;
-                    else if (p2Clean && cleanText.includes(p2Clean)) score += 500;
 
-                    if (ticketPref === "bonus" && text.includes("福利")) score += 300;
-                    if (ticketPref === "normal" && !text.includes("福利")) score += 300;
+                // 導入 TicketPlus 權重邏輯
+                if (statusText.includes('熱賣中') || text.includes('熱賣中')) score += 100;
+                if (statusText.includes('剩餘') || text.includes('剩餘')) score -= 100;
 
-                    if (statusText.includes('熱賣中') || text.includes('熱賣中')) score += 50;
-                }
-                return { row, score, text };
-            }).filter(item => item.score > 0);
+                // 同區票種偏好
+                if (ticketPref === "bonus" && text.includes("福利")) score += 300;
+                if (ticketPref === "normal" && !text.includes("福利")) score += 300;
 
-            scoredRows.sort((a, b) => b.score - a.score);
+                validCandidates.push({ row, score, text });
+            });
 
-            let targetObj = null;
-            if (scoredRows.length > 0) {
-                if (scoredRows[0].score === 1) {
-                    if (mode === "bottom") targetObj = scoredRows[scoredRows.length - 1];
-                    else if (mode === "random") targetObj = scoredRows[Math.floor(Math.random() * scoredRows.length)];
-                    else targetObj = scoredRows[0];
-                } else {
-                    targetObj = scoredRows[0];
+            if (validCandidates.length === 0) {
+                if (Date.now() - pageLoadTime > 2500) window.location.reload();
+                return;
+            }
+
+            // 🌟 2. 指定區域篩選 (支援多詞空格)
+            if (areaKw.trim() !== "") {
+                const areaKws = areaKw.split(/\s+/).filter(k => k);
+                if (areaKws.length > 0) {
+                    validCandidates = validCandidates.filter(item => {
+                        return areaKws.every(kw => item.text.includes(kw));
+                    });
                 }
             }
 
+            if (validCandidates.length === 0) {
+                if (Date.now() - pageLoadTime > 2500) window.location.reload();
+                return;
+            }
+
+            // 🌟 3. 逗號優先順序篩選
+            let finalCandidates = [];
+            if (rawPriceKw.trim() !== "") {
+                let priceList = rawPriceKw.split(/[,，]/).map(p => p.replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '').trim()).filter(p => p);
+                for (let price of priceList) {
+                    let tempMatches = validCandidates.filter(item => {
+                        const cleanText = item.text.replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '');
+                        return cleanText.includes(price);
+                    });
+                    if (tempMatches.length > 0) {
+                        finalCandidates = tempMatches;
+                        break;
+                    }
+                }
+                // 智慧降級
+                if (finalCandidates.length === 0) finalCandidates = validCandidates;
+            } else {
+                finalCandidates = validCandidates;
+            }
+
+            // 🌟 4. 權重最高者鎖定與模式套用
+            if (finalCandidates.length > 0) {
+                const maxScore = Math.max(...finalCandidates.map(item => item.score));
+                finalCandidates = finalCandidates.filter(item => item.score === maxScore);
+            }
+
+            let targetObj = null;
+            if (finalCandidates.length > 0) {
+                if (mode === "bottom") targetObj = finalCandidates[finalCandidates.length - 1];
+                else if (mode === "random") targetObj = finalCandidates[Math.floor(Math.random() * finalCandidates.length)];
+                else targetObj = finalCandidates[0]; // mode === "top"
+            }
+
+            // 🌟 5. 執行點擊
             if (targetObj) {
-                isWaitingForResponse = true;
+                setWaitingState();
                 const targetRow = targetObj.row;
                 const zoneName = targetRow.innerText.trim().substring(0, 10).replace(/\n/g, '');
 
                 if (hasSelects) {
-                    let targetSelect = targetRow.querySelector('select[id*="AMOUNT"], select[name*="AMOUNT"]');
-                    if (!targetSelect) targetSelect = queryAllDeep('select')[0];
+                    let targetSelect = targetRow.querySelector('select');
+                    if (!targetSelect) {
+                        targetSelect = document.querySelector('table select[id*="AMOUNT"], table select[name*="AMOUNT"]');
+                    }
 
                     if (targetSelect) {
                         let options = Array.from(targetSelect.options);
@@ -380,30 +461,26 @@
                         setTimeout(() => {
                             let nextBtn = queryAllDeep('a, button').find(el => {
                                 let txt = el.innerText || "";
-                                return txt.includes("下一步") || (el.id && el.id.includes("AddShopingCart"));
+                                return txt.includes("下一步") || (el.id && el.id.includes("AddShopingCart")) || txt.includes("다음 단계");
                             });
                             if (nextBtn) {
                                 nextBtn.click();
-                                toast("✅ 已點擊下一步！請手動完成驗證碼付款！");
-                            } else {
-                                toast("⚠️ 找不到下一步按鈕，請手動點擊！", "error");
+                                toast("✅ 已點擊下一步！");
                             }
                         }, 700);
                         return true;
                     }
                 }
                 else {
-                    const delayTime = Math.floor(Math.random() * 500) + 700;
+                    const delayTime = Math.floor(Math.random() * 400) + 400;
                     toast(`🎯 鎖定 [${zoneName}]，等待 ${delayTime}ms 安全點擊...`);
 
                     setTimeout(() => {
-                        const clickable = targetRow.querySelector('.action a, a, button, input[type="radio"]') || targetRow;
+                        const clickable = targetRow.querySelector('.action a:not([onclick*="delete"]), a:not([href*="7-11"]):not([onclick*="delete"]), button:not([class*="delete"]), input[type="radio"]') || targetRow;
                         clickable.click();
                     }, delayTime);
                     return true;
                 }
-            } else if (Date.now() - pageLoadTime > 2500) {
-                window.location.reload();
             }
         }
     }
@@ -411,18 +488,20 @@
     function main() {
         if (!running || isWaitingForResponse || !document.body) return;
 
-        // 🛡️ 【核心機制】檢查是否正在進行真人驗證或排隊
-        if (isQueuingOrAntiBot()) {
-            if (!window.queueNotified) {
-                toast("⏳ 系統防護驗證中... 腳本已自動靜默暫停重整，請通過驗證！", "warning");
-                window.queueNotified = true;
+        try {
+            if (isQueuingOrAntiBot()) {
+                if (!window.queueNotified) {
+                    toast("⏳ 系統防護驗證中... 腳本已自動靜默暫停重整，請通過驗證！", "warning");
+                    window.queueNotified = true;
+                }
+                return;
+            } else {
+                window.queueNotified = false;
             }
-            return; // 💥 完全阻斷腳本繼續執行，保護 IP 不被封鎖！
-        } else {
-            window.queueNotified = false; // 離開排隊後解除靜默狀態
+            executeIbonFlow();
+        } catch (error) {
+            console.error("Ibon 腳本執行錯誤：", error);
         }
-
-        executeIbonFlow();
     }
 
     function startLoop() { if (!loopId) loopId = setInterval(() => { if (running) main(); }, LOOP_INTERVAL); }
@@ -439,30 +518,17 @@
                 GM_deleteValue(SCHEDULE_KEY);
                 running = true;
                 GM_setValue(STORAGE_KEY, 'true');
+                updateUIState();
                 toast("🔥 排程已觸發！系統接管中...");
-
-                const startBtn = document.getElementById("start");
-                if(startBtn) {
-                    startBtn.innerText = "🔄 監控中 (每秒重整)";
-                    startBtn.style.background = "#10b981";
-                }
                 startLoop();
             } else {
-                const startBtn = document.getElementById("start");
-                if(startBtn) {
-                    startBtn.innerText = `⏳ 等待 ${scheduledTime} 開搶...`;
-                    startBtn.style.background = "#f59e0b";
-                }
+                updateUIState();
                 toast(`⏳ 排程恢復：將於 ${scheduledTime} 自動啟動...`);
                 startScheduleLoop(scheduledTime);
             }
         }
         else if (running) {
-            const startBtn = document.getElementById("start");
-            if(startBtn) {
-                startBtn.innerText = "🔄 監控中 (每秒重整)";
-                startBtn.style.background = "#10b981";
-            }
+            updateUIState();
             toast("🔄 跨網域/重整喚醒！自動接續執行中...");
             startLoop();
         }
